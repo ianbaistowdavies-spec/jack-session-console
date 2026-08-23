@@ -1,0 +1,188 @@
+{
+  "product": "Jack Session Console",
+  "host": "jack-pc",
+  "updated": "2026-08-23",
+  "docker": {
+    "required": false,
+    "allowed_for_capture": false,
+    "allowed_for_companion": false,
+    "verdict": "do-not-wrap",
+    "reason": "Capture must run on the Windows host next to the game, NVENC, WASAPI loopback, and the webcam. Docker Desktop on Windows adds WSL2 RAM cost, does not hook fullscreen games, and GPU-PV is for compute/transcode — not Game Capture."
+  },
+  "install_policy": {
+    "fail_loud": true,
+    "atomic_ready_flag": true,
+    "ready_means": "Every required dependency is present, verified, and capture preflight did not fail. The installer must not leave a Ready state if recording cannot start.",
+    "never_auto_publish": true
+  },
+  "required_host": [
+    {
+      "id": "windows",
+      "name": "Windows 10 22H2+ or Windows 11 x64",
+      "kind": "os",
+      "install": "manual",
+      "check": "os"
+    },
+    {
+      "id": "winget",
+      "name": "App Installer / winget",
+      "kind": "package-manager",
+      "install": "store-or-app-installer",
+      "check": "winget"
+    },
+    {
+      "id": "vcredist",
+      "name": "Microsoft Visual C++ 2015-2022 Redistributable (x64)",
+      "kind": "runtime",
+      "winget_id": "Microsoft.VCRedist.2015+.x64",
+      "install": "winget",
+      "check": "winget-id"
+    },
+    {
+      "id": "dotnet8-desktop",
+      "name": ".NET 8 Desktop Runtime (x64)",
+      "kind": "runtime",
+      "winget_id": "Microsoft.DotNet.DesktopRuntime.8",
+      "install": "winget",
+      "check": "dotnet",
+      "notes": "Host capture service and desk UI shell. Desktop runtime covers Windows-native APIs."
+    },
+    {
+      "id": "ffmpeg",
+      "name": "FFmpeg with NVENC",
+      "kind": "codec",
+      "winget_id": "Gyan.FFmpeg",
+      "install": "winget",
+      "check": "ffmpeg-nvenc",
+      "notes": "Remux, proxies, commit transcodes. Isolated masters should encode via NVENC, not libx264, while a game is running."
+    },
+    {
+      "id": "nvidia-gpu",
+      "name": "NVIDIA GPU with NVENC (8 GB class accepted)",
+      "kind": "hardware",
+      "install": "manual",
+      "check": "nvidia-smi",
+      "notes": "Do not silently replace GPU drivers. Verify nvidia-smi and NVENC. Jack's leftover VRAM budget is ~2 GB while gaming."
+    },
+    {
+      "id": "nvidia-driver",
+      "name": "NVIDIA Game Ready / NVIDIA App driver with NVENC",
+      "kind": "driver",
+      "winget_id": "NVIDIA.NVIDIAApp",
+      "install": "prompt-only",
+      "check": "nvidia-smi",
+      "notes": "Driver installs need a reboot and can upset games. Offer NVIDIA App; never force-install without Jack confirming."
+    }
+  ],
+  "required_devices": [
+    {
+      "id": "microphone",
+      "name": "Windows recording device (microphone)",
+      "check": "audio-in",
+      "required_for_record": true
+    },
+    {
+      "id": "game-audio",
+      "name": "WASAPI loopback / desktop audio",
+      "check": "audio-loopback",
+      "required_for_record": true,
+      "notes": "Inbox on Windows. No extra package."
+    },
+    {
+      "id": "webcam",
+      "name": "Camera facing Jack",
+      "check": "camera",
+      "required_for_record": true
+    },
+    {
+      "id": "disk",
+      "name": "Session disk with free space",
+      "check": "disk",
+      "min_free_gb": 50,
+      "required_for_record": true
+    }
+  ],
+  "soft_requirements": [
+    {
+      "id": "displays",
+      "name": "Two monitors",
+      "check": "displays",
+      "min": 2,
+      "on_fail": "warn",
+      "notes": "Game on monitor 1, desk console on monitor 2. Single monitor is not a hard install failure."
+    },
+    {
+      "id": "lan",
+      "name": "Private LAN / Wi-Fi for Android companion",
+      "check": "lan-private",
+      "on_fail": "warn"
+    },
+    {
+      "id": "edge",
+      "name": "Microsoft Edge (inbox) for monitor-2 PWA",
+      "check": "edge",
+      "on_fail": "warn"
+    }
+  ],
+  "optional": [
+    {
+      "id": "obs",
+      "name": "OBS Studio",
+      "winget_id": "OBSProject.OBSStudio",
+      "install": "optional-winget",
+      "notes": "Fallback capture backend only. Not the default while gaming (compositor VRAM). Do not auto-start OBS on login."
+    },
+    {
+      "id": "chrome",
+      "name": "Google Chrome",
+      "winget_id": "Google.Chrome",
+      "install": "optional-winget",
+      "notes": "Monitor-2 UI works in Edge. Chrome is optional."
+    }
+  ],
+  "gateway": {
+    "id": "ian-gpu-interpret",
+    "status": "parked-not-needed",
+    "required_on_jack": false,
+    "notes": "Spare cycles on Ian's GPU are not in scope. Jack's recorder must not depend on another machine."
+  },
+  "companion": [
+    {
+      "id": "android-app",
+      "name": "Jack Session Console companion APK",
+      "install": "sideload-or-play",
+      "min_android": 8,
+      "notes": "Installed on the phone, not by the PC installer. PC installer prints pairing QR after host is Ready."
+    }
+  ],
+  "forbidden_as_required": [
+    {
+      "id": "docker-desktop",
+      "name": "Docker Desktop",
+      "reason": "Not used for capture, preview, or the companion. Do not install as part of Jack's setup."
+    },
+    {
+      "id": "cuda-toolkit",
+      "name": "CUDA Toolkit",
+      "reason": "NVENC is in the driver. CUDA toolkit is compile-time bloat and VRAM-adjacent software Jack does not need."
+    },
+    {
+      "id": "python",
+      "name": "Python as a host runtime",
+      "reason": "Capture service is native (.NET). Python may appear later for offline detectors, never on the game-time path."
+    }
+  ],
+  "publish_secrets": [
+    {
+      "id": "youtube",
+      "name": "YouTube Data API OAuth client (Jack's Google account)",
+      "install": "not-during-host-setup",
+      "notes": "Configured in the studio after a committed recording exists. Never a reason to mark the recorder Ready."
+    },
+    {
+      "id": "discord",
+      "name": "Discord webhook or bot token",
+      "install": "not-during-host-setup"
+    }
+  ]
+}
