@@ -1,25 +1,25 @@
 # Jack Session Console
 
-Session recorder for Jack’s gaming PC: isolated game / camera / audio tracks, Android companion over Wi-Fi, publish only after a committed recording.
+Session recorder for Jack’s gaming PC: isolated game / camera / audio tracks, no overlay on the match, mix after Stop.
 
-**Docker is not used.** Capture stays on the Windows host. See `docs/DEPENDENCIES.md`.
+**Docker is not used.** Capture stays on the Windows host.
 
-## Install on Jack’s computer
+## For Jack
 
-Elevated PowerShell:
+Read **`README-JACK.txt`**. Short version:
+
+1. Right-click `Install.bat` → Run as administrator (once).
+2. Double-click `Start-JackConsole.bat` before a session.
+3. **F9** rec, **F10** stop, **F8** marker. Game stays focused.
+4. After Stop, optional **Make YouTube mix**. Raw tracks stay in `Videos\JackSessions\`.
+
+Use **borderless windowed** in the game, not exclusive fullscreen.
+
+## Installer (advanced)
 
 ```powershell
-cd C:\Users\ianba\Projects\jack-session-console
-Set-ExecutionPolicy -Scope Process Bypass
 .\install\Install-JackConsole.ps1
-```
-
-Verify without installing:
-
-```powershell
 .\install\Install-JackConsole.ps1 -VerifyOnly
 ```
 
-The installer writes `state/install-state.json` **atomically**. `status` is `ready` only if every required dependency is present and verified. Otherwise it is `not-ready`: the box must not claim it is recording and must not publish.
-
-Exit codes: `0` ready, `2` not ready, `1` install error.
+Exit codes: `0` ready, `2` not ready, `1` install error. Atomic Ready flag: `state/install-state.json`.

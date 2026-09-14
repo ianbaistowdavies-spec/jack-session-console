@@ -62,7 +62,7 @@
       "kind": "hardware",
       "install": "manual",
       "check": "nvidia-smi",
-      "notes": "Do not silently replace GPU drivers. Verify nvidia-smi and NVENC. Jack's leftover VRAM budget is ~2 GB while gaming."
+      "notes": "Jack: RTX 5060 8 GB (Blackwell, 1x 9th-gen NVENC). Do not silently replace GPU drivers. Verify nvidia-smi and NVENC. Leftover VRAM budget is ~2 GB while gaming. System RAM is 16 GB — keep the recorder native and small."
     },
     {
       "id": "nvidia-driver",

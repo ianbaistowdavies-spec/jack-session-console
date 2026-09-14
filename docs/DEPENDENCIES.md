@@ -90,8 +90,12 @@ The installer exits:
 
 ## Jack’s hardware envelope (do not “fix” with more software)
 
+See `docs/JACK-PC.md`. Confirmed 2026-09-13:
+
+- TUF Gaming B550M-Plus WiFi II, Ryzen 7 5800X, **RTX 5060 8 GB**, **16 GB RAM**
 - 8 GB GPU, ~6 GB in the game, ~2 GB leftover
-- Capture = host NVENC + isolated files
+- 16 GB system RAM is the other ceiling — no Chromium live UI, no frame buffers in RAM
+- Capture = host NVENC (5060 = 9th gen, AV1 available) + isolated files
 - Preview = Off / Proxy / absent
 - Proxy JPEG over Wi-Fi to the Android app
 - No compositor in the game process
