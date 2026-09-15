@@ -6,7 +6,7 @@ Source: Jack, via Ian. Unverified on the machine until installer preflight.
 |---|---|
 | Motherboard | ASUS TUF Gaming B550M-Plus WiFi II |
 | CPU | AMD Ryzen 7 5800X (8C/16T, Zen 3) |
-| GPU | NVIDIA GeForce RTX 5060 — **8 GB GDDR7**, Blackwell, 1× 9th-gen NVENC (H.264 / HEVC / AV1) |
+| GPU | NVIDIA GeForce **RTX 5060 Ti** — **8 GB** (8151 MiB reported), Blackwell, 1× 9th-gen NVENC (H.264 / HEVC / AV1). Confirmed on-box 2026-09-14 via installer `nvidia-smi`. |
 | RAM | 16 GB |
 | Wi-Fi | On-board (B550M-Plus WiFi II) — phone companion is possible on the same LAN |
 

@@ -121,6 +121,36 @@ function Install-WingetPackage {
     }
 }
 
+function Update-SessionPath {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = @($machine, $user) -join ';'
+}
+
+function Find-FfmpegExe {
+    Update-SessionPath
+    $cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $direct = @(
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\ffmpeg.exe')
+    )
+    $searchRoots = @(
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'),
+        (Join-Path $env:ProgramFiles 'WinGet\Packages'),
+        (Join-Path $env:ProgramFiles 'ffmpeg'),
+        (Join-Path ${env:ProgramFiles(x86)} 'ffmpeg')
+    )
+    foreach ($c in $direct) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    foreach ($root in $searchRoots) {
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+        $hit = Get-ChildItem -LiteralPath $root -Filter ffmpeg.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
+
 function Get-NvidiaSmi {
     $candidates = @(
         (Join-Path $env:ProgramFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'),
@@ -135,13 +165,13 @@ function Get-NvidiaSmi {
 }
 
 function Test-NvencInFfmpeg {
-    $ff = Get-Command ffmpeg -ErrorAction SilentlyContinue
-    if (-not $ff) { return [pscustomobject]@{ present = $false; nvenc = $false; path = $null } }
-    $enc = & ffmpeg -hide_banner -encoders 2>&1 | Out-String
+    $path = Find-FfmpegExe
+    if (-not $path) { return [pscustomobject]@{ present = $false; nvenc = $false; path = $null } }
+    $enc = & $path -hide_banner -encoders 2>&1 | Out-String
     return [pscustomobject]@{
         present = $true
         nvenc   = ($enc -match 'h264_nvenc' -or $enc -match 'hevc_nvenc')
-        path    = $ff.Source
+        path    = $path
     }
 }
 
@@ -307,9 +337,9 @@ Invoke-RequiredPackage -Id 'dotnet8-desktop' -Name '.NET 8 Desktop Runtime' -Win
     return ($runtimes -match 'Microsoft\.WindowsDesktop\.App 8\.') -or (Test-WingetPackage -Id 'Microsoft.DotNet.DesktopRuntime.8')
 }
 
-# FFmpeg
+# FFmpeg (winget updates PATH for *new* shells only — refresh this process)
 Invoke-RequiredPackage -Id 'ffmpeg' -Name 'FFmpeg' -WingetId 'Gyan.FFmpeg' -Verify {
-    $null -ne (Get-Command ffmpeg -ErrorAction SilentlyContinue)
+    $null -ne (Find-FfmpegExe)
 }
 
 $ff = Test-NvencInFfmpeg
@@ -379,8 +409,12 @@ $checks.Add((New-Check -Id 'microphone' -Name 'Microphone / capture endpoint' -S
 if ($mic.ok) { Write-Log -Level OK 'Microphone/capture endpoint present' } else { Write-Log -Level FAIL 'No microphone/capture endpoint - NOT RECORDING capable' }
 
 $cam = Test-Camera
-$checks.Add((New-Check -Id 'webcam' -Name 'Camera' -Severity 'required' -Ok $cam.ok -Detail $cam.detail)) | Out-Null
-if ($cam.ok) { Write-Log -Level OK "Camera: $($cam.detail)" } else { Write-Log -Level FAIL 'No camera - NOT RECORDING capable' }
+$checks.Add((New-Check -Id 'webcam' -Name 'Camera' -Severity 'soft' -Ok $cam.ok -Detail $cam.detail)) | Out-Null
+if ($cam.ok) {
+    Write-Log -Level OK "Camera: $($cam.detail)"
+} else {
+    Write-Log -Level WARN 'No camera right now — game + mic recording still allowed. Plug the webcam in and pick it in Start-JackConsole.'
+}
 
 # Disk
 if (-not $SessionDrive) {

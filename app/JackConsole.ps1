@@ -442,8 +442,8 @@ $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 
 $screens = [Windows.Forms.Screen]::AllScreens
-$home = if ($screens.Count -gt 1) { $screens | Where-Object { -not $_.Primary } | Select-Object -First 1 } else { $screens[0] }
-$form.Location = New-Object Drawing.Point(($home.WorkingArea.X + 40), ($home.WorkingArea.Y + 40))
+$deskScreen = if ($screens.Count -gt 1) { $screens | Where-Object { -not $_.Primary } | Select-Object -First 1 } else { $screens[0] }
+$form.Location = New-Object Drawing.Point(($deskScreen.WorkingArea.X + 40), ($deskScreen.WorkingArea.Y + 40))
 
 function Add-Label($text, $x, $y, $w = 200, $h = 24) {
     $l = New-Object Windows.Forms.Label
@@ -591,7 +591,7 @@ foreach ($a in $devs.audio) {
     [void]$cmbMic.Items.Add($a)
     [void]$cmbDesk.Items.Add($a)
 }
-if ($cmbCam.Items.Count -gt 0) { $cmbCam.SelectedIndex = 0 }
+if ($cmbCam.Items.Count -gt 0) { $cmbCam.SelectedIndex = 0 } else { $chkCam.Checked = $false }
 if ($cmbMic.Items.Count -gt 0) { $cmbMic.SelectedIndex = 0 }
 # Prefer a loopback-ish name for desktop audio
 $loop = $null
@@ -610,6 +610,7 @@ if ($cfg.camera -and $cmbCam.Items.Contains($cfg.camera)) { $cmbCam.SelectedItem
 if ($cfg.mic -and $cmbMic.Items.Contains($cfg.mic)) { $cmbMic.SelectedItem = $cfg.mic }
 if ($cfg.deskAudio -and $cmbDesk.Items.Contains($cfg.deskAudio)) { $cmbDesk.SelectedItem = $cfg.deskAudio }
 if ($cfg.display -ge 0 -and $cfg.display -lt $cmbDisplay.Items.Count) { $cmbDisplay.SelectedIndex = $cfg.display }
+if ($cmbCam.Items.Count -eq 0) { $chkCam.Checked = $false }
 
 if (-not $script:Ffmpeg) {
     $lblStatus.Text = 'NOT READY — run Install.bat'

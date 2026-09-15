@@ -18,8 +18,8 @@ Install (once)
 --------------
 1. Unzip this folder somewhere lasting, e.g.  C:\JackSessionConsole
 2. Right-click  Install.bat  →  Run as administrator
-3. Wait until it says READY (or read the red lines if something is missing:
-   camera, mic, NVIDIA driver, disk space).
+3. Wait until it says READY (or read the red lines if FFmpeg / GPU / disk
+   failed). No webcam is a warning only — you can still record the game.
 4. If Windows SmartScreen complains: More info → Run anyway.
 
 
