@@ -1,6 +1,9 @@
 Jack Session Console
 ====================
 
+Read WHAT-THIS-IS.txt first — what this is, what v0.1 put on the PC,
+and how to remove it.
+
 A recorder for your gaming PC. It sits NEXT TO the game, not on top of it.
 
 What it captures (separate files, mix later):

@@ -1,0 +1,134 @@
+Jack Session Console — what this actually is
+============================================
+
+In one sentence
+---------------
+A small recorder that sits in its own window, captures your game / camera /
+mic / Discord as separate files, and lets you mix them AFTER you stop.
+It is not a live stream, not YouTube, not an overlay on the game, not OBS.
+
+
+What you get when you press Rec
+-------------------------------
+Four (optional) files in a dated folder, usually under Videos\JackSessions\:
+
+  game.mp4      picture of the monitor the game is on
+  cam.mp4       webcam, if you tick it
+  mic.m4a       your voice
+  desktop.m4a   whatever you are hearing (game + Discord if that is in Windows)
+
+After Stop you can optionally click “Make YouTube mix” — that is just a
+rough single video with the cam in the corner. The four raw files stay,
+so you can edit properly in CapCut / DaVinci / Premiere later.
+
+Nothing is drawn on the game. The window lives on the desk (or a second
+monitor). F9 start, F10 stop, F8 timestamp — those keys are global, so they
+work while the game has focus. If a game already uses F9/F10, say so and
+we will change them.
+
+
+What v0.1 actually put on your PC
+---------------------------------
+Install.bat (the one you ran as administrator) used Windows’ own installer
+(winget). From your screenshot, this is what happened:
+
+  1. Microsoft Visual C++ 2015–2022 Redistributable (x64)
+     Shared library lots of games already need. Harmless if it was already
+     there. We do not remove this if you uninstall us — games use it.
+
+  2. .NET 8 Desktop Runtime (x64)
+     Microsoft’s library for Windows desktop apps. Your log showed this
+     installed. Other software may also use it.
+
+  3. FFmpeg 9.0.1 (Gyan full build, ~239 MB)
+     The encoder. This is the one that changed your PATH
+     (“Path environment variable modified; restart your shell”).
+     This is the most likely cause of “the PC feels different” after
+     install: other tools that call ffmpeg, or anything that reads PATH
+     at startup, can see a new ffmpeg first.
+
+  4. The folder D:\JackSessionConsole
+     Our scripts only. Not a Windows service. Not a driver. Not a
+     startup app. Nothing runs until you double-click Start-JackConsole.bat.
+
+What we checked but did NOT install:
+
+  - NVIDIA driver     (yours is fine — RTX 5060 Ti, 8 GB, driver 610.62)
+  - NVIDIA App        (not installed; we never force a driver)
+  - OBS Studio        (not installed)
+  - Docker / Python / CUDA   (deliberately not used)
+  - Camera            (none plugged in — that is OK, game+mic still work)
+  - Anything that starts with Windows
+
+We never got as far as recording. The first Start-JackConsole crashed on
+a PowerShell bug (fixed in v0.2). So in-game capture is not what made
+the machine wobble. The suspects are the FFmpeg PATH change and the two
+Microsoft runtimes.
+
+
+How to check what is on the machine
+-----------------------------------
+In a normal (not admin) PowerShell:
+
+  winget list Gyan.FFmpeg
+  winget list Microsoft.DotNet.DesktopRuntime.8
+  winget list Microsoft.VCRedist.2015+.x64
+  Get-Command ffmpeg | Format-List Source
+  echo $env:Path
+
+If ffmpeg’s Source is under WinGet or Program Files\ffmpeg, that is us.
+
+
+How to take it off (if you want the PC back to before)
+------------------------------------------------------
+1. Delete the folder  D:\JackSessionConsole
+2. In admin PowerShell:
+
+     winget uninstall --id Gyan.FFmpeg
+
+   That is the important one. It should put PATH back.
+
+3. .NET 8 Desktop Runtime — only uninstall if nothing else needs it:
+
+     winget uninstall --id Microsoft.DotNet.DesktopRuntime.8
+
+4. Leave the VC++ redistributable. Games want it.
+
+5. Reboot once after uninstalling FFmpeg.
+
+You do not have to uninstall to try v0.2. Overwriting D:\JackSessionConsole
+is enough for the crash fix. Uninstall FFmpeg only if the box still feels
+wrong.
+
+
+v0.2 (crash fix) — only if you still want this version
+------------------------------------------------------
+https://github.com/ianbaistowdavies-spec/jack-session-console/releases/download/v0.2/JackSessionConsole.zip
+
+Same idea as v0.1. Fixes:
+  - the red “Cannot overwrite variable HOME” crash
+  - installer finding FFmpeg without restarting the window
+  - no camera is a warning, not a brick wall
+
+Still uses PowerShell + system FFmpeg. If the PC has been unstable, it is
+reasonable to uninstall FFmpeg (step 2 above) and wait. The next version
+should keep FFmpeg inside our folder and leave your PATH alone.
+
+
+What this is not
+----------------
+- Not OBS (no scene compositor sitting on the game)
+- Not NVIDIA ShadowPlay (your driver already has that for game-only clips)
+- Not a YouTube uploader
+- Not always-on, not in the system tray unless you start it
+- Not allowed to publish anything. Files stay on your disk.
+
+
+If something still feels off
+----------------------------
+Screenshot:
+  - Task Manager → Startup apps
+  - the winget list commands above
+  - any crash/hang at the moment it happens
+
+and send it to Ian. Do not run Install.bat on a loop.
