@@ -36,8 +36,40 @@ public class JackHotkeys : IMessageFilter {
 }
 "@
 
+# FFmpeg writes its log on a threadpool thread. A PowerShell event scriptblock
+# on that thread tears down the runspace and closes this window, while ffmpeg
+# keeps recording. The sink stays in C# so the console survives.
+Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Collections.Concurrent;
+public class ErrTail {
+    readonly ConcurrentQueue<string> lines = new ConcurrentQueue<string>();
+    public void Attach(Process p) {
+        p.ErrorDataReceived += OnLine;
+        p.OutputDataReceived += OnLine;
+    }
+    public void OnLine(object sender, DataReceivedEventArgs e) {
+        if (string.IsNullOrEmpty(e.Data)) return;
+        lines.Enqueue(e.Data);
+        string dump;
+        while (lines.Count > 80 && lines.TryDequeue(out dump)) { }
+    }
+    public string Tail(int n) {
+        string[] arr = lines.ToArray();
+        int start = Math.Max(0, arr.Length - n);
+        if (start >= arr.Length) return "";
+        string[] slice = new string[arr.Length - start];
+        Array.Copy(arr, start, slice, 0, slice.Length);
+        return string.Join("\n", slice);
+    }
+}
+"@
+
 $script:AppData = Join-Path $env:APPDATA 'JackSessionConsole'
 $script:SettingsPath = Join-Path $script:AppData 'settings.json'
+$script:PidFile = Join-Path $script:AppData 'recording-pids.json'
+$script:Tray = $null
 $script:DefaultOut = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'JackSessions'
 $script:Ffmpeg = $null
 $script:Procs = New-Object System.Collections.Generic.List[System.Diagnostics.Process]
@@ -115,6 +147,8 @@ function Get-DshowDevices {
     $p = [Diagnostics.Process]::Start($psi)
     $err = $p.StandardError.ReadToEnd()
     $p.WaitForExit(8000) | Out-Null
+    # FFmpeg 6 and older print a "DirectShow audio devices" header, then quoted names.
+    # FFmpeg 7+ drops that header and tags the name on the same line: "Mic" (audio).
     $section = ''
     foreach ($line in ($err -split "`r?`n")) {
         if ($line -match 'DirectShow video devices') { $section = 'video'; continue }
@@ -122,8 +156,15 @@ function Get-DshowDevices {
         if ($line -match 'Alternative name') { continue }
         if ($line -match '"([^"]+)"') {
             $name = $Matches[1]
-            if ($section -eq 'video') { $video.Add($name) }
-            elseif ($section -eq 'audio') { $audio.Add($name) }
+            if ($name -like '@device*') { continue }
+            $isVideo = $line -match '\(video'
+            $isAudio = $line -match '\(audio'
+            if (-not $isVideo -and -not $isAudio) {
+                if ($section -eq 'video') { $isVideo = $true }
+                elseif ($section -eq 'audio') { $isAudio = $true }
+            }
+            if ($isVideo) { $video.Add($name) }
+            if ($isAudio) { $audio.Add($name) }
         }
     }
     return @{ video = $video; audio = $audio }
@@ -162,26 +203,74 @@ function Start-Ffmpeg([string[]]$ArgList, [string]$Tag) {
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
     $p.EnableRaisingEvents = $true
-    $script:ErrTails[$Tag] = New-Object System.Collections.Generic.List[string]
-    $p.add_ErrorDataReceived({
-        param($sender, $e)
-        if ($e.Data) {
-            $list = $script:ErrTails[$Tag]
-            if ($list.Count -gt 80) { $list.RemoveAt(0) }
-            $list.Add($e.Data)
-        }
-    })
+    $sink = New-Object ErrTail
+    $script:ErrTails[$Tag] = $sink
+    $sink.Attach($p)
     [void]$p.Start()
     $p.BeginErrorReadLine()
     $p.BeginOutputReadLine()
     Start-Sleep -Milliseconds 400
     if ($p.HasExited) {
-        $tail = ($script:ErrTails[$Tag] | Select-Object -Last 12) -join "`n"
+        $tail = $sink.Tail(12)
         throw "$Tag failed to start.`n$tail"
     }
     $p | Add-Member -NotePropertyName JackTag -NotePropertyValue $Tag
     $script:Procs.Add($p)
+    Save-RecordingPids
     return $p
+}
+
+function Save-RecordingPids {
+    try {
+        Ensure-Dir $script:AppData
+        $ids = New-Object System.Collections.Generic.List[int]
+        foreach ($proc in @($script:Procs)) {
+            if ($proc -and -not $proc.HasExited) { $ids.Add([int]$proc.Id) }
+        }
+        $payload = [pscustomobject]@{
+            pids = @($ids)
+            dir  = [string]$script:SessionDir
+        }
+        ($payload | ConvertTo-Json) | Set-Content -LiteralPath $script:PidFile -Encoding UTF8
+    } catch { }
+}
+
+function Clear-RecordingPids {
+    try {
+        if (Test-Path -LiteralPath $script:PidFile) {
+            Remove-Item -LiteralPath $script:PidFile -Force
+        }
+    } catch { }
+}
+
+function Stop-OrphanFfmpeg {
+    # If a previous console crashed, ffmpeg is still recording with no Stop button.
+    $killed = 0
+    if (-not (Test-Path -LiteralPath $script:PidFile)) { return 0 }
+    try {
+        $saved = Get-Content -LiteralPath $script:PidFile -Raw | ConvertFrom-Json
+        $allParentsDead = $true
+        foreach ($id in @($saved.pids)) {
+            $procId = [int]$id
+            $op = Get-Process -Id $procId -ErrorAction SilentlyContinue
+            if (-not $op) { continue }
+            if ($op.ProcessName -ne 'ffmpeg') { $allParentsDead = $false; continue }
+            $parentAlive = $false
+            try {
+                $w = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$procId" -ErrorAction Stop
+                if ($w.ParentProcessId) {
+                    $parentAlive = $null -ne (Get-Process -Id ([int]$w.ParentProcessId) -ErrorAction SilentlyContinue)
+                }
+            } catch { }
+            if ($parentAlive) { $allParentsDead = $false; continue }
+            try {
+                Stop-Process -Id $procId -Force -ErrorAction Stop
+                $killed++
+            } catch { }
+        }
+        if ($allParentsDead) { Clear-RecordingPids }
+    } catch { }
+    return $killed
 }
 
 function Stop-AllFfmpeg {
@@ -203,6 +292,7 @@ function Stop-AllFfmpeg {
         $p.Dispose()
     }
     $script:Procs.Clear()
+    Clear-RecordingPids
 }
 
 function Get-Elapsed {
@@ -349,10 +439,21 @@ function Add-Marker {
     $lblMark.Text = "Marker $line"
 }
 
+function Show-ConsoleWindow {
+    if ($form.WindowState -eq 'Minimized') { $form.WindowState = 'Normal' }
+    $form.Show()
+    $form.TopMost = [bool]$script:Recording
+    $form.Activate()
+}
+
 function Set-UiRecording([bool]$on) {
+    $form.TopMost = $on
+    $form.ShowInTaskbar = $true
     if ($on) {
+        $form.Text = 'Jack Session Console — RECORDING'
         $lblStatus.Text = 'RECORDING'
         $lblStatus.ForeColor = [Drawing.Color]::FromArgb(255, 70, 70)
+        $lblMark.Text = 'Stays open — press Stop or F10'
         $btnRec.Enabled = $false
         $btnStop.Enabled = $true
         $btnMix.Enabled = $false
@@ -360,9 +461,15 @@ function Set-UiRecording([bool]$on) {
         $cmbCam.Enabled = $false
         $cmbMic.Enabled = $false
         $cmbDesk.Enabled = $false
+        if ($form.WindowState -eq 'Minimized') { $form.WindowState = 'Normal' }
+        $form.Show()
+        $form.Activate()
+        if ($script:Tray) { $script:Tray.Text = 'Recording — click to stop' }
     } else {
+        $form.Text = 'Jack Session Console'
         $lblStatus.Text = 'NOT RECORDING'
         $lblStatus.ForeColor = [Drawing.Color]::FromArgb(180, 220, 140)
+        $lblMark.Text = ''
         $btnRec.Enabled = $true
         $btnStop.Enabled = $false
         $btnMix.Enabled = [bool]$script:LastSession
@@ -371,6 +478,7 @@ function Set-UiRecording([bool]$on) {
         $cmbMic.Enabled = $true
         $cmbDesk.Enabled = $true
         $lblElapsed.Text = '00:00:00'
+        if ($script:Tray) { $script:Tray.Text = 'Jack Session Console' }
     }
 }
 
@@ -428,6 +536,22 @@ function New-YoutubeMix {
         [Windows.Forms.MessageBox]::Show("Mix failed. See mix.log in:`n$script:LastSession", 'Jack Session Console') | Out-Null
     }
 }
+
+# A click-handler error must not end the message loop and close the window.
+try {
+    [Windows.Forms.Application]::SetUnhandledExceptionMode([Windows.Forms.UnhandledExceptionMode]::CatchException)
+} catch { }
+[Windows.Forms.Application]::add_ThreadException({
+    param($sender, $e)
+    try {
+        Ensure-Dir $script:AppData
+        $line = '{0}  {1}' -f (Get-Date).ToString('o'), $e.Exception.ToString()
+        Add-Content -LiteralPath (Join-Path $script:AppData 'console.log') -Value $line
+    } catch { }
+    try {
+        [Windows.Forms.MessageBox]::Show("Something went wrong, but the window stays open.`n$($e.Exception.Message)", 'Jack Session Console') | Out-Null
+    } catch { }
+})
 
 # --- UI ---
 $form = New-Object Windows.Forms.Form
@@ -618,30 +742,80 @@ if (-not $script:Ffmpeg) {
     $btnRec.Enabled = $false
 }
 
-$btnRec.Add_Click({ Start-Session })
-$btnStop.Add_Click({ Stop-Session })
-$btnMark.Add_Click({ Add-Marker })
-$btnMix.Add_Click({ New-YoutubeMix })
+function Invoke-Ui([scriptblock]$Action) {
+    try {
+        & $Action
+    } catch {
+        try {
+            Ensure-Dir $script:AppData
+            $line = '{0}  {1}' -f (Get-Date).ToString('o'), $_.Exception.ToString()
+            Add-Content -LiteralPath (Join-Path $script:AppData 'console.log') -Value $line
+        } catch { }
+        [Windows.Forms.MessageBox]::Show("Something went wrong, but the window stays open.`n$($_.Exception.Message)", 'Jack Session Console') | Out-Null
+    }
+}
+
+$btnRec.Add_Click({ Invoke-Ui { Start-Session } })
+$btnStop.Add_Click({ Invoke-Ui { Stop-Session } })
+$btnMark.Add_Click({ Invoke-Ui { Add-Marker } })
+$btnMix.Add_Click({ Invoke-Ui { New-YoutubeMix } })
 $btnBrowse.Add_Click({
     $d = New-Object Windows.Forms.FolderBrowserDialog
     $d.SelectedPath = $txtOut.Text
     if ($d.ShowDialog() -eq 'OK') { $txtOut.Text = $d.SelectedPath }
 })
 
+$script:Tray = New-Object Windows.Forms.NotifyIcon
+$script:Tray.Icon = [Drawing.SystemIcons]::Application
+$script:Tray.Visible = $true
+$script:Tray.Text = 'Jack Session Console'
+$script:TrayMenu = New-Object Windows.Forms.ContextMenuStrip
+$miShow = New-Object Windows.Forms.ToolStripMenuItem 'Show window'
+$miStop = New-Object Windows.Forms.ToolStripMenuItem 'Stop recording'
+$miQuit = New-Object Windows.Forms.ToolStripMenuItem 'Quit'
+$miShow.Add_Click({ Show-ConsoleWindow })
+$miStop.Add_Click({ Invoke-Ui { Stop-Session } })
+$miQuit.Add_Click({
+    if ($script:Recording) { Invoke-Ui { Stop-Session } }
+    $form.Close()
+})
+[void]$script:TrayMenu.Items.Add($miShow)
+[void]$script:TrayMenu.Items.Add($miStop)
+[void]$script:TrayMenu.Items.Add($miQuit)
+$script:Tray.ContextMenuStrip = $script:TrayMenu
+$script:Tray.Add_DoubleClick({ Show-ConsoleWindow })
+
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 250
 $timer.Add_Tick({
-    if ($script:Recording) { $lblElapsed.Text = Get-Elapsed }
+    if (-not $script:Recording) { return }
+    $lblElapsed.Text = Get-Elapsed
+    if (-not $form.Visible) { $form.Show() }
+    if (-not $form.TopMost) { $form.TopMost = $true }
+    if ($script:Tray) {
+        $tip = 'Recording ' + (Get-Elapsed) + ' — click to stop'
+        if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
+        if ($script:Tray.Text -ne $tip) { $script:Tray.Text = $tip }
+    }
 })
 $timer.Start()
 
 $hot = New-Object JackHotkeys
 $hot.Add_HotKeyPressed({
     param($id)
-    switch ($id) {
-        1 { if ($script:Recording) { Stop-Session } else { Start-Session } }
-        2 { Stop-Session }
-        3 { Add-Marker }
+    try {
+        switch ($id) {
+            1 { if ($script:Recording) { Stop-Session } else { Start-Session } }
+            2 { Stop-Session }
+            3 { Add-Marker }
+        }
+    } catch {
+        try {
+            Ensure-Dir $script:AppData
+            $line = '{0}  {1}' -f (Get-Date).ToString('o'), $_.Exception.ToString()
+            Add-Content -LiteralPath (Join-Path $script:AppData 'console.log') -Value $line
+        } catch { }
+        [Windows.Forms.MessageBox]::Show("Something went wrong, but the window stays open.`n$($_.Exception.Message)", 'Jack Session Console') | Out-Null
     }
 })
 [Windows.Forms.Application]::AddMessageFilter($hot)
@@ -652,13 +826,39 @@ $form.Add_Shown({
     [void][JackHotkeys]::RegisterHotKey($form.Handle, 3, 0, 0x77) # F8
 })
 $form.Add_FormClosing({
+    param($sender, $e)
+    # Closing the window is what used to strand a recording with no Stop button.
+    if ($script:Recording -and $e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
+        $e.Cancel = $true
+        Show-ConsoleWindow
+        $lblMark.Text = 'Still recording — press Stop or F10'
+        return
+    }
     if ($script:Recording) { Stop-Session }
     [void][JackHotkeys]::UnregisterHotKey($form.Handle, 1)
     [void][JackHotkeys]::UnregisterHotKey($form.Handle, 2)
     [void][JackHotkeys]::UnregisterHotKey($form.Handle, 3)
     Save-Settings
     $timer.Stop()
+    if ($script:Tray) {
+        $script:Tray.Visible = $false
+        $script:Tray.Dispose()
+        $script:Tray = $null
+    }
 })
 
+$orphanCount = Stop-OrphanFfmpeg
+if ($orphanCount -gt 0 -and $script:Ffmpeg) {
+    $lblLast.Text = "Stopped $orphanCount leftover recording process(es)."
+}
+
 [Windows.Forms.Application]::EnableVisualStyles()
-[void]$form.ShowDialog()
+try {
+    [void]$form.ShowDialog()
+} finally {
+    if ($script:Tray) {
+        $script:Tray.Visible = $false
+        $script:Tray.Dispose()
+        $script:Tray = $null
+    }
+}
