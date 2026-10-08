@@ -1,2 +1,4 @@
 state/
 install/_parse-check.ps1
+app/ffmpeg/
+JackSessionConsole-for-gemini-review.txt

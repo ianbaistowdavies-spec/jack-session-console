@@ -66,12 +66,81 @@ public class ErrTail {
 }
 "@
 
+# If this process dies, the job handle closes and Windows kills every ffmpeg
+# still in it. Recording uses a fragmented MP4 so that kill still leaves a playable file.
+Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+public class JackJob : IDisposable {
+    IntPtr handle;
+    bool disposed;
+    const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+    const int JobObjectExtendedLimitInformation = 9;
+    [StructLayout(LayoutKind.Sequential)]
+    struct IO_COUNTERS {
+        public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+        public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateJobObject(IntPtr a, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr hJob, int cls, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, uint cb);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr h);
+    public JackJob() {
+        handle = CreateJobObject(IntPtr.Zero, null);
+        if (handle == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        uint size = (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+        if (!SetInformationJobObject(handle, JobObjectExtendedLimitInformation, ref info, size))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+    public void AddProcess(Process p) {
+        if (!AssignProcessToJobObject(handle, p.Handle))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+    public void Dispose() {
+        if (disposed) return;
+        disposed = true;
+        if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
+    }
+}
+"@
+
 $script:AppData = Join-Path $env:APPDATA 'JackSessionConsole'
 $script:SettingsPath = Join-Path $script:AppData 'settings.json'
 $script:PidFile = Join-Path $script:AppData 'recording-pids.json'
 $script:Tray = $null
 $script:DefaultOut = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'JackSessions'
 $script:Ffmpeg = $null
+$script:HasDdagrab = $false
+$script:Job = $null
+$script:GameCapture = $null
 $script:Procs = New-Object System.Collections.Generic.List[System.Diagnostics.Process]
 $script:Recording = $false
 $script:SessionDir = $null
@@ -87,6 +156,8 @@ function Ensure-Dir([string]$Path) {
 }
 
 function Get-FfmpegPath {
+    $bundled = Join-Path $PSScriptRoot 'ffmpeg\ffmpeg.exe'
+    if (Test-Path -LiteralPath $bundled) { return $bundled }
     $cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
     $candidates = @(
@@ -185,6 +256,42 @@ function Test-Nvenc {
     return ($out -match 'h264_nvenc')
 }
 
+function Test-FfmpegDevice([string]$Name) {
+    if (-not $script:Ffmpeg) { return $false }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $script:Ffmpeg
+    $psi.Arguments = '-hide_banner -devices'
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd()
+    $p.WaitForExit(8000) | Out-Null
+    return ($out -match ('\b' + [regex]::Escape($Name) + '\b'))
+}
+
+function Get-CaptureJob {
+    if ($script:Job) { return $script:Job }
+    try { $script:Job = New-Object JackJob } catch { $script:Job = $null }
+    return $script:Job
+}
+
+function Get-LiveNvencArgs {
+    # p4, no lookahead, no B-frames: one NVENC session, little extra VRAM, game keeps the shaders.
+    return @(
+        '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'll', '-rc', 'vbr',
+        '-cq', '23', '-b:v', '8M', '-maxrate', '12M',
+        '-rc-lookahead', '0', '-bf', '0', '-spatial-aq', '0', '-temporal-aq', '0',
+        '-multipass', 'disabled'
+    )
+}
+
+function Get-FragFlags {
+    # Playable even if the process is killed before it can finish a normal moov atom.
+    return @('-movflags', '+frag_keyframe+empty_moov+default_base_moof')
+}
+
 function Quote-Arg([string]$s) {
     if ($s -match '[\s"]') { return '"' + ($s -replace '"', '\"') + '"' }
     return $s
@@ -207,16 +314,21 @@ function Start-Ffmpeg([string[]]$ArgList, [string]$Tag) {
     $script:ErrTails[$Tag] = $sink
     $sink.Attach($p)
     [void]$p.Start()
+    try { $p.PriorityClass = 'BelowNormal' } catch { }
+    try {
+        $job = Get-CaptureJob
+        if ($job) { $job.AddProcess($p) }
+    } catch { }
     $p.BeginErrorReadLine()
     $p.BeginOutputReadLine()
+    $p | Add-Member -NotePropertyName JackTag -NotePropertyValue $Tag
+    $script:Procs.Add($p)
+    Save-RecordingPids
     Start-Sleep -Milliseconds 400
     if ($p.HasExited) {
         $tail = $sink.Tail(12)
         throw "$Tag failed to start.`n$tail"
     }
-    $p | Add-Member -NotePropertyName JackTag -NotePropertyValue $Tag
-    $script:Procs.Add($p)
-    Save-RecordingPids
     return $p
 }
 
@@ -316,77 +428,110 @@ function Start-Session {
     $script:Markers = New-Object System.Collections.Generic.List[string]
     $script:ErrTails = @{}
     $script:Procs.Clear()
-    $nv = Test-Nvenc
-    $vCodec = if ($nv) { @('-c:v', 'h264_nvenc', '-preset', 'p5', '-rc', 'vbr', '-cq', '23', '-b:v', '8M', '-maxrate', '12M') } else { @('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21') }
+    $script:GameCapture = $null
+    if (-not (Test-Nvenc)) {
+        [Windows.Forms.MessageBox]::Show('This FFmpeg has no NVENC. Recording the game on the CPU would hitch the match, so nothing was started.', 'Jack Session Console') | Out-Null
+        return
+    }
+    try {
+        $qual = Split-Path -Qualifier $outRoot
+        if ($qual) {
+            $free = (Get-PSDrive -Name $qual.TrimEnd(':') -ErrorAction Stop).Free
+            if ($free -lt 8GB) {
+                [Windows.Forms.MessageBox]::Show('Less than 8 GB free on the session drive. Free some space, then record.', 'Jack Session Console') | Out-Null
+                return
+            }
+        }
+    } catch { }
 
+    $vCodec = Get-LiveNvencArgs
+    $frag = Get-FragFlags
+    $warnings = New-Object System.Collections.Generic.List[string]
     try {
         $screen = [Windows.Forms.Screen]::AllScreens[$cmbDisplay.SelectedIndex]
         if (-not $screen) { $screen = [Windows.Forms.Screen]::PrimaryScreen }
         $idx = [int]$cmbDisplay.SelectedIndex
         $gamePath = Join-Path $script:SessionDir 'game.mp4'
-        $dda = @(
-            '-hide_banner', '-y', '-loglevel', 'warning', '-stats',
-            '-f', 'ddagrab', '-output_idx', "$idx", '-framerate', '60', '-draw_mouse', '1', '-i', 'desktop'
-        ) + $vCodec + @('-pix_fmt', 'yuv420p', '-movflags', '+faststart', (Quote-Arg $gamePath))
-        try {
-            Start-Ffmpeg -ArgList $dda -Tag 'game'
-        } catch {
+        $startedGame = $false
+        if ($script:HasDdagrab) {
+            $gpu = @(
+                '-hide_banner', '-y', '-loglevel', 'warning',
+                '-f', 'ddagrab', '-output_idx', "$idx", '-framerate', '60', '-draw_mouse', '1', '-i', 'desktop',
+                '-vf', 'scale_d3d11=format=nv12'
+            ) + $vCodec + $frag + @((Quote-Arg $gamePath))
+            try {
+                Start-Ffmpeg -ArgList $gpu -Tag 'game'
+                $script:GameCapture = 'ddagrab'
+                $startedGame = $true
+            } catch {
+                $plain = @(
+                    '-hide_banner', '-y', '-loglevel', 'warning',
+                    '-f', 'ddagrab', '-output_idx', "$idx", '-framerate', '60', '-draw_mouse', '1', '-i', 'desktop'
+                ) + $vCodec + $frag + @((Quote-Arg $gamePath))
+                try {
+                    Start-Ffmpeg -ArgList $plain -Tag 'game'
+                    $script:GameCapture = 'ddagrab'
+                    $startedGame = $true
+                } catch { }
+            }
+        }
+        if (-not $startedGame) {
             $gdi = @(
-                '-hide_banner', '-y', '-loglevel', 'warning', '-stats',
+                '-hide_banner', '-y', '-loglevel', 'warning',
                 '-f', 'gdigrab', '-framerate', '60',
                 '-offset_x', "$([int]$screen.Bounds.X)", '-offset_y', "$([int]$screen.Bounds.Y)",
                 '-video_size', ('{0}x{1}' -f $screen.Bounds.Width, $screen.Bounds.Height),
                 '-i', 'desktop'
-            ) + $vCodec + @('-pix_fmt', 'yuv420p', '-movflags', '+faststart', (Quote-Arg $gamePath))
+            ) + $vCodec + @('-pix_fmt', 'yuv420p') + $frag + @((Quote-Arg $gamePath))
             Start-Ffmpeg -ArgList $gdi -Tag 'game'
+            $script:GameCapture = 'gdi'
         }
 
         if ($chkCam.Checked -and $cmbCam.SelectedItem) {
-            $camPath = Join-Path $script:SessionDir 'cam.mp4'
-            $camArgs = @(
-                '-hide_banner', '-y', '-loglevel', 'warning', '-stats',
-                '-f', 'dshow', '-rtbufsize', '256M', '-framerate', '30',
-                '-i', ('video="{0}"' -f (([string]$cmbCam.SelectedItem) -replace '"', '')),
-                '-vf', 'scale=1280:-2',
-                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-                '-pix_fmt', 'yuv420p', '-an',
-                (Quote-Arg $camPath)
-            )
-            Start-Ffmpeg -ArgList $camArgs -Tag 'cam'
+            try {
+                $camPath = Join-Path $script:SessionDir 'cam.mp4'
+                $camArgs = @(
+                    '-hide_banner', '-y', '-loglevel', 'warning',
+                    '-f', 'dshow', '-rtbufsize', '64M', '-framerate', '30',
+                    '-i', ('video="{0}"' -f (([string]$cmbCam.SelectedItem) -replace '"', '')),
+                    '-vf', 'scale=1280:-2',
+                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                    '-pix_fmt', 'yuv420p', '-an'
+                ) + $frag + @((Quote-Arg $camPath))
+                Start-Ffmpeg -ArgList $camArgs -Tag 'cam'
+            } catch {
+                $warnings.Add('Camera: ' + $_.Exception.Message)
+            }
         }
 
         if ($chkMic.Checked -and $cmbMic.SelectedItem) {
-            $micPath = Join-Path $script:SessionDir 'mic.m4a'
-            $micArgs = @(
-                '-hide_banner', '-y', '-loglevel', 'warning', '-stats',
-                '-f', 'dshow', '-rtbufsize', '64M',
-                '-i', ('audio="{0}"' -f (([string]$cmbMic.SelectedItem) -replace '"', '')),
-                '-c:a', 'aac', '-b:a', '192k',
-                (Quote-Arg $micPath)
-            )
-            Start-Ffmpeg -ArgList $micArgs -Tag 'mic'
+            try {
+                $micPath = Join-Path $script:SessionDir 'mic.m4a'
+                $micArgs = @(
+                    '-hide_banner', '-y', '-loglevel', 'warning',
+                    '-f', 'dshow', '-rtbufsize', '64M',
+                    '-i', ('audio="{0}"' -f (([string]$cmbMic.SelectedItem) -replace '"', '')),
+                    '-c:a', 'aac', '-b:a', '192k'
+                ) + $frag + @((Quote-Arg $micPath))
+                Start-Ffmpeg -ArgList $micArgs -Tag 'mic'
+            } catch {
+                $warnings.Add('Mic: ' + $_.Exception.Message)
+            }
         }
 
         if ($chkDesk.Checked -and $cmbDesk.SelectedItem) {
-            $deskPath = Join-Path $script:SessionDir 'desktop.m4a'
-            $deskName = [string]$cmbDesk.SelectedItem
-            $deskArgs = @(
-                '-hide_banner', '-y', '-loglevel', 'warning', '-stats',
-                '-f', 'dshow', '-rtbufsize', '64M',
-                '-i', ('audio="{0}"' -f ($deskName -replace '"', '')),
-                '-c:a', 'aac', '-b:a', '192k',
-                (Quote-Arg $deskPath)
-            )
             try {
+                $deskPath = Join-Path $script:SessionDir 'desktop.m4a'
+                $deskName = [string]$cmbDesk.SelectedItem
+                $deskArgs = @(
+                    '-hide_banner', '-y', '-loglevel', 'warning',
+                    '-f', 'dshow', '-rtbufsize', '64M',
+                    '-i', ('audio="{0}"' -f ($deskName -replace '"', '')),
+                    '-c:a', 'aac', '-b:a', '192k'
+                ) + $frag + @((Quote-Arg $deskPath))
                 Start-Ffmpeg -ArgList $deskArgs -Tag 'desktop'
             } catch {
-                $wasapi = @(
-                    '-hide_banner', '-y', '-loglevel', 'warning', '-stats',
-                    '-f', 'wasapi', '-i', (Quote-Arg $deskName),
-                    '-c:a', 'aac', '-b:a', '192k',
-                    (Quote-Arg $deskPath)
-                )
-                Start-Ffmpeg -ArgList $wasapi -Tag 'desktop'
+                $warnings.Add('Desktop audio: ' + $_.Exception.Message)
             }
         }
     } catch {
@@ -401,7 +546,8 @@ function Start-Session {
         product   = 'Jack Session Console'
         started   = $script:SessionStart.ToString('o')
         dir       = $script:SessionDir
-        nvenc     = $nv
+        nvenc     = $true
+        capture   = [string]$script:GameCapture
         display   = [string]$cmbDisplay.SelectedItem
         camera    = $(if ($chkCam.Checked) { [string]$cmbCam.SelectedItem } else { $null })
         mic       = $(if ($chkMic.Checked) { [string]$cmbMic.SelectedItem } else { $null })
@@ -411,6 +557,30 @@ function Start-Session {
     ($manifest | ConvertTo-Json) | Set-Content (Join-Path $script:SessionDir 'session.json') -Encoding UTF8
     Set-UiRecording $true
     Save-Settings
+    if ($warnings.Count -gt 0) {
+        $lblMark.Text = 'Game is recording. A side track failed.'
+        [Windows.Forms.MessageBox]::Show(($warnings -join "`n`n"), 'Jack Session Console') | Out-Null
+    }
+}
+
+function Repair-Mp4([string]$Path) {
+    if (-not $script:Ffmpeg) { return }
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if ((Get-Item -LiteralPath $Path).Length -lt 4096) { return }
+    $tmp = $Path + '.fast.mp4'
+    $args = @('-hide_banner', '-y', '-loglevel', 'error', '-i', (Quote-Arg $Path), '-c', 'copy', '-movflags', '+faststart', (Quote-Arg $tmp))
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $script:Ffmpeg
+    $psi.Arguments = ($args -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    if (-not $p.WaitForExit(120000)) { try { $p.Kill() } catch { } }
+    if ($p.ExitCode -eq 0 -and (Test-Path -LiteralPath $tmp) -and (Get-Item -LiteralPath $tmp).Length -gt 4096) {
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+    } else {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Stop-Session {
@@ -418,6 +588,9 @@ function Stop-Session {
     Stop-AllFfmpeg
     $script:Recording = $false
     $script:LastSession = $script:SessionDir
+    foreach ($name in @('game.mp4', 'cam.mp4', 'mic.m4a', 'desktop.m4a')) {
+        Repair-Mp4 (Join-Path $script:SessionDir $name)
+    }
     if ($script:Markers.Count -gt 0) {
         $script:Markers | Set-Content (Join-Path $script:SessionDir 'markers.txt') -Encoding UTF8
     }
@@ -442,16 +615,14 @@ function Add-Marker {
 function Show-ConsoleWindow {
     if ($form.WindowState -eq 'Minimized') { $form.WindowState = 'Normal' }
     $form.Show()
-    $form.TopMost = [bool]$script:Recording
     $form.Activate()
 }
 
 function Set-UiRecording([bool]$on) {
-    $form.TopMost = $on
     $form.ShowInTaskbar = $true
     if ($on) {
         $form.Text = 'Jack Session Console — RECORDING'
-        $lblStatus.Text = 'RECORDING'
+        $lblStatus.Text = if ($script:GameCapture -eq 'gdi') { 'RECORDING (GDI)' } else { 'RECORDING' }
         $lblStatus.ForeColor = [Drawing.Color]::FromArgb(255, 70, 70)
         $lblMark.Text = 'Stays open — press Stop or F10'
         $btnRec.Enabled = $false
@@ -461,9 +632,6 @@ function Set-UiRecording([bool]$on) {
         $cmbCam.Enabled = $false
         $cmbMic.Enabled = $false
         $cmbDesk.Enabled = $false
-        if ($form.WindowState -eq 'Minimized') { $form.WindowState = 'Normal' }
-        $form.Show()
-        $form.Activate()
         if ($script:Tray) { $script:Tray.Text = 'Recording — click to stop' }
     } else {
         $form.Text = 'Jack Session Console'
@@ -709,6 +877,7 @@ $lblLast = Add-Label 'Nothing recorded this session yet.' 310 446 230 28
 $lblLast.ForeColor = [Drawing.Color]::Silver
 
 $script:Ffmpeg = Get-FfmpegPath
+$script:HasDdagrab = Test-FfmpegDevice 'ddagrab'
 $devs = Get-DshowDevices
 foreach ($v in $devs.video) { [void]$cmbCam.Items.Add($v) }
 foreach ($a in $devs.audio) {
@@ -790,8 +959,6 @@ $timer.Interval = 250
 $timer.Add_Tick({
     if (-not $script:Recording) { return }
     $lblElapsed.Text = Get-Elapsed
-    if (-not $form.Visible) { $form.Show() }
-    if (-not $form.TopMost) { $form.TopMost = $true }
     if ($script:Tray) {
         $tip = 'Recording ' + (Get-Elapsed) + ' — click to stop'
         if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
@@ -856,6 +1023,8 @@ if ($orphanCount -gt 0 -and $script:Ffmpeg) {
 try {
     [void]$form.ShowDialog()
 } finally {
+    if ($script:Recording) { Stop-Session }
+    if ($script:Job) { $script:Job.Dispose(); $script:Job = $null }
     if ($script:Tray) {
         $script:Tray.Visible = $false
         $script:Tray.Dispose()

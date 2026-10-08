@@ -129,6 +129,8 @@ function Update-SessionPath {
 
 function Find-FfmpegExe {
     Update-SessionPath
+    $bundled = Join-Path (Split-Path $PSScriptRoot -Parent) 'app\ffmpeg\ffmpeg.exe'
+    if (Test-Path -LiteralPath $bundled) { return $bundled }
     $cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
     $direct = @(
